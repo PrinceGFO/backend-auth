@@ -1,3 +1,4 @@
+import uuid
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -17,6 +18,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    full_name = Column(String, nullable=True)
+    bio = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -110,3 +113,65 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 @app.get("/auth/me")
 def read_me(current_user: User = Depends(get_current_user)):
     return {"email": current_user.email, "id": current_user.id, "message": f"Welcome Prince, you are authenticated!"}
+
+
+# --- Forgot Password ---
+reset_tokens = {}
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+@app.post("/auth/forgot-password")
+def forgot_password(data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    token = str(uuid.uuid4())
+    reset_tokens[token] = {"user_id": user.id, "expires": datetime.utcnow() + timedelta(minutes=15)}
+    return {"message": "Reset token generated", "reset_token": token}
+
+@app.post("/auth/reset-password")
+def reset_password(data: ResetPasswordRequest, db: Session = Depends(get_db)):
+    if data.token not in reset_tokens:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    token_data = reset_tokens[data.token]
+    if datetime.utcnow() > token_data["expires"]:
+        del reset_tokens[data.token]
+        raise HTTPException(status_code=400, detail="Token expired")
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+    user = db.query(User).filter(User.id == token_data["user_id"]).first()
+    user.hashed_password = hash_password(data.new_password)
+    db.commit()
+    del reset_tokens[data.token]
+    return {"message": "Password reset successfully"}
+
+# --- DAY 3: Change Password ---
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+@app.post("/auth/change-password")
+def change_password(
+    data: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # 1. Check old password is correct
+    if not verify_password(data.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Old password is incorrect")
+    if data.old_password == data.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from old password")
+    
+    # 2. New password must be different and at least 6 chars
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+
+    # 3. Save new hashed password
+    current_user.hashed_password = hash_password(data.new_password)
+    db.commit()
+    return {"message": "Password changed successfully"}
